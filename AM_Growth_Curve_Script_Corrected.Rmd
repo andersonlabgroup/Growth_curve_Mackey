@@ -1,0 +1,224 @@
+---
+title: "AM Growth Curve Analysis Script with Trimming Function"
+output: html_document
+---
+
+#Sources used to help write this script
+https://rpubs.com/artur_matysik/plot-96well-heatmap
+https://www.doubling-time.com/compute.php
+
+
+```{r}
+#These packages are necessary to run this script, you may need to install them beforehand
+library(ggpmisc)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(Deriv)
+library(gridExtra)
+library(tidyverse)
+library(ggforce)
+library(scales)
+```
+
+
+```{r}
+# Pulls in the data file for usage
+dat = read.csv(file.choose(),
+              header = TRUE,
+              stringsAsFactors = FALSE)
+```
+
+
+```{r}
+#Check data format
+head(dat)
+tail(dat)
+```
+
+
+```{r}
+#create empty lists to output plots
+plot_fit_1 = list()
+plot_fit_2= list()
+title <- colnames(dat[,6:101])
+
+#creates empty matrix where doubling time data will be stored
+dub_out <- matrix(data=NA, nrow = 96, ncol = 4)
+dub_out <- as.data.frame(dub_out)
+dub_out$V1 <- colnames(dat[,6:101])
+r <- c(rep(1, 12),rep(2, 12),rep(3, 12),rep(4, 12),rep(5, 12),rep(6, 12),rep(7, 12),rep(8, 12))
+c <- c(rep(seq(1, 12, 1), 8))
+dub_out$V3 <- r
+dub_out$V4 <- c
+```
+
+
+```{r}
+#loop that cycles through each well (column in data file) one at a time
+for(i in 1:(ncol(dat)-5)){
+  #subsets individual column
+  col <- dat[,c(1,i+5)]
+  col <- rename(col, OD=2)
+  #fits polynomial model to raw data
+  model <- lm(OD ~ poly(Minutes,20), data = col)
+  
+  #outputs plot looking at polynomial fit over entire curve, this fit is only used for trimming
+  p1 <- ggplot(data = col, aes(x=Minutes, y=OD))+geom_point()+stat_smooth(method = "lm", formula = y~poly(x,20))
+  
+  #for empty or blank wells these will not be subject to analysis
+  if (max(col$OD) <0.3) {
+    doubling <- 0
+    dub <- as.character(round(doubling, digits=1))
+    dub <- paste("DT =", dub, sep = " ")
+     p2=ggplot(data = col, aes(x=Minutes, y=OD))+geom_point()+stat_smooth(method = "lm", formula = y~poly(x,10))+ggtitle(title[i], subtitle = dub)
+  }
+  
+  #for wells with observed growth
+  if (max(col$OD) >= 0.3){
+  
+  #predict OD from polynomial model for all time points, this data will be used to detect the first predicted drop in OD 
+  #This is a more robust method than looking for a drop in raw OD data
+  test <- data.frame(Minutes=col$Minutes)
+  col$predict <- predict(model, newdata = test)
+  
+  #caulcuate differences in predicted OD
+  col <- col %>%
+    mutate(diff=predict-lag(predict))
+  
+  #for trimming data we only look at differences in predictions above 0.2, <0.2 is at the lower detection limit of most plate readers, this may be more subject to predicted decreases
+  col_low <- col %>%
+    filter(OD<=0.22)
+  
+  #OD >0.2 will be subject to trimming (removal of data after a predicted drop in OD), if no predicted decrease is observed data is not trimmed
+  col_high <- col %>%
+    filter(OD>0.22)
+  a <- c(col_high$diff >0)
+  
+  if (length(which(a == TRUE)) != nrow(col_high)){
+  b <- which(!a, arr.ind = TRUE)[1]
+  col_high <- col_high[1:b,]
+  }
+  
+  #concatenates low OD data (<=0.2) and trimmed high OD data
+  col_fin <- rbind(col_low, col_high)
+  
+  #refit polynomial model to trimmed data, this is just for visualization
+  model_fin <- lm(OD ~ poly(Minutes,10), data = col_fin)
+  
+  #Selects region of data where the script will look to calculate doubling time
+  col_reg <- col_fin %>%
+    filter(OD>0.3) %>%
+    filter(OD<1.25)
+  
+  #A sliding window is used to find the greatest slope
+  #An empty matrix is used to store windows assessed and slope from linear regression
+  #select window size here, currenly the window is set to assess 6 data points at a time (i.e. 6 time points where the OD was read, 'reg$V2 <- seq(6, nrow(reg)+5,1)')
+  #To change the size of the sliding window adjust code on line 122  
+  #for instance if you want to look at 5 data points at a time adjust the code to 'reg$V2 <- seq(5, nrow(reg)+4,1)'
+  reg <- matrix(data=NA, nrow = nrow(col_reg), ncol = 5)
+  reg <- as.data.frame(reg)
+  reg$V1 <- seq(1,nrow(reg),1)
+  reg$V2 <- seq(6, nrow(reg)+5,1)
+  reg <- reg %>%
+    filter(V2<=nrow(col_reg))
+  
+  #For each window we find the linear regression and store the slope
+  for(t in 1:nrow(reg)){
+    v <- reg[t,]
+    v_reg <- col_reg[c(v$V1:v$V2),]
+    m <- lm(OD ~ Minutes, data = v_reg)
+    reg[t,3] <- summary(m)$coefficients[2,1]
+  }
+  
+  #find greatest slope and location of that regression (time points)
+  best <- reg[which.max(reg$V3),]
+  lower <- col_reg[c(best$V1),]
+  upper <- col_reg[c(best$V2),]
+  text <- best$V3
+  text <- as.character(round(text, digits = 1))
+  text <- paste("slope =", text, sep = " ")
+  
+  #find predicted OD values based on the regression with greatest slope, these predicted values will be used to calculate doubling time 
+  pred <- col_reg[row.names(lower):rownames(upper),]
+  model_2 <- lm(OD ~ Minutes, data = pred)
+  slope <- summary(model_2)$coefficients[2,1]
+  intercept <- summary(model_2)$coefficients[1,1]
+  pred$predict <- slope*pred$Minutes+intercept
+  upper$predict <- pred[nrow(pred),3]
+  lower$predict <- pred[1,3]
+  
+  #calculate doubling time
+  doubling <- ((upper$Minutes-lower$Minutes)*log10(2))/(log10(upper$predict)-log10(lower$predict))
+  
+  dub <- as.character(round(doubling, digits=1))
+  dub <- paste("DT =", dub, sep = " ")
+  
+  #plots trimmed data, polynomial fit for visualization, and dashed lines showing the region selected to calculate doubling time
+   p2=ggplot(data = col_fin, aes(x=Minutes, y=OD))+geom_point()+stat_smooth(method = "lm", formula = y~poly(x,10))+geom_hline(yintercept = lower$OD, color="blue", linetype="dashed")+geom_hline(yintercept = upper$OD, color="blue", linetype="dashed")+ggtitle(title[i], subtitle = dub)
+  }
+
+  dub_out[i,2] <- doubling
+  
+  plot_fit_1[[i]]= p1
+  plot_fit_2[[i]]= p2
+  
+}
+```
+
+
+```{r}
+#shows 96 well plate format containing heatmap and doubling times
+show_dt <- round(dub_out$V2, digits = 1)
+dub_out = rename(dub_out, "doubling time (minutes)" = V2)
+
+plot_96 = ggplot(data = dub_out) + geom_circle(aes(x0 = V4, y0 = V3, r = 0.45, fill =`doubling time (minutes)`))+ coord_equal()+ scale_x_continuous(breaks = 1:12, expand = expansion(mult = c(0.01, 0.01))) + scale_y_continuous(breaks = 1:8, labels = LETTERS[1:8], expand = expansion(mult = c(0.01, 0.01)), trans = reverse_trans())+theme(axis.title.x = element_blank(), axis.title.y = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),legend.position = "none")+scale_fill_gradient(low = "white", high = "purple") + labs(title = "96 Well plate", x = "Col", y = "Row")+theme_bw()+geom_text(aes(x = V4, y = V3, label = paste0(show_dt)), size = 3)
+
+#Adjust the file name to save plot under a different name, keep .png to save image as a png
+ggsave(file = "AW_96_well_plate.png", plot_96)
+```
+
+
+```{r}
+#outputs doubling time in CSV
+dub_out_final <- dub_out %>%
+   rename(row= V3)%>%
+   rename(column = V4)%>%
+   rename(well = V1)
+write.csv(dub_out_final, file = "AW_dub_out.csv")
+```
+
+
+```{r}
+#These plots are arranged such that each page of the PDF shows data from wells in one column
+#generates PDF containing plots showing trimmed data, polynomial fit for visualization, and dashed lines showing the region selected to calculate doubling time
+pdf("AW_plots_column.pdf", onefile = T)
+ grid.arrange(plot_fit_2[[1]],plot_fit_2[[13]], plot_fit_2[[25]], plot_fit_2[[37]], plot_fit_2[[49]], plot_fit_2[[61]], plot_fit_2[[73]], plot_fit_2[[85]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[2]],plot_fit_2[[14]], plot_fit_2[[26]], plot_fit_2[[38]], plot_fit_2[[50]], plot_fit_2[[62]], plot_fit_2[[74]], plot_fit_2[[86]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[3]],plot_fit_2[[15]], plot_fit_2[[27]], plot_fit_2[[39]], plot_fit_2[[51]], plot_fit_2[[63]], plot_fit_2[[75]], plot_fit_2[[87]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[4]],plot_fit_2[[16]], plot_fit_2[[28]], plot_fit_2[[40]], plot_fit_2[[52]], plot_fit_2[[64]], plot_fit_2[[76]], plot_fit_2[[88]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[5]],plot_fit_2[[17]], plot_fit_2[[29]], plot_fit_2[[41]], plot_fit_2[[53]], plot_fit_2[[65]], plot_fit_2[[77]], plot_fit_2[[89]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[6]],plot_fit_2[[18]], plot_fit_2[[30]], plot_fit_2[[42]], plot_fit_2[[54]], plot_fit_2[[66]], plot_fit_2[[78]], plot_fit_2[[90]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[7]],plot_fit_2[[19]], plot_fit_2[[31]], plot_fit_2[[43]], plot_fit_2[[55]], plot_fit_2[[67]], plot_fit_2[[79]], plot_fit_2[[91]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[8]],plot_fit_2[[20]], plot_fit_2[[32]], plot_fit_2[[44]], plot_fit_2[[56]], plot_fit_2[[68]], plot_fit_2[[80]], plot_fit_2[[92]], ncol=4, nrow=2)
+grid.arrange(plot_fit_2[[9]],plot_fit_2[[21]], plot_fit_2[[33]], plot_fit_2[[45]], plot_fit_2[[57]], plot_fit_2[[69]], plot_fit_2[[81]], plot_fit_2[[93]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[10]],plot_fit_2[[22]], plot_fit_2[[34]], plot_fit_2[[46]], plot_fit_2[[58]], plot_fit_2[[70]], plot_fit_2[[82]], plot_fit_2[[94]], ncol=4, nrow=2)
+grid.arrange(plot_fit_2[[11]],plot_fit_2[[23]], plot_fit_2[[35]], plot_fit_2[[47]], plot_fit_2[[59]], plot_fit_2[[71]], plot_fit_2[[83]], plot_fit_2[[95]], ncol=4, nrow=2)
+ grid.arrange(plot_fit_2[[12]],plot_fit_2[[24]], plot_fit_2[[36]], plot_fit_2[[48]], plot_fit_2[[60]], plot_fit_2[[72]], plot_fit_2[[84]], plot_fit_2[[96]], ncol=4, nrow=2)
+dev.off()
+```
+
+
+```{r}
+#Alternatively, these same plots can be outputed such that each page contains data from all wells in one row
+pdf("AW_plots_row.pdf", onefile = T)
+ grid.arrange(plot_fit_2[[1]],plot_fit_2[[2]], plot_fit_2[[3]], plot_fit_2[[4]], plot_fit_2[[5]], plot_fit_2[[6]], plot_fit_2[[7]], plot_fit_2[[8]], plot_fit_2[[9]], plot_fit_2[[10]], plot_fit_2[[11]], plot_fit_2[[12]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[13]],plot_fit_2[[14]], plot_fit_2[[15]], plot_fit_2[[16]], plot_fit_2[[17]], plot_fit_2[[18]], plot_fit_2[[19]], plot_fit_2[[20]], plot_fit_2[[21]], plot_fit_2[[22]], plot_fit_2[[23]], plot_fit_2[[24]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[25]],plot_fit_2[[26]], plot_fit_2[[27]], plot_fit_2[[28]], plot_fit_2[[29]], plot_fit_2[[30]], plot_fit_2[[31]], plot_fit_2[[32]], plot_fit_2[[33]], plot_fit_2[[34]], plot_fit_2[[35]], plot_fit_2[[36]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[37]],plot_fit_2[[38]], plot_fit_2[[39]], plot_fit_2[[40]], plot_fit_2[[41]], plot_fit_2[[42]], plot_fit_2[[43]], plot_fit_2[[44]], plot_fit_2[[45]], plot_fit_2[[46]], plot_fit_2[[47]], plot_fit_2[[48]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[49]],plot_fit_2[[50]], plot_fit_2[[51]], plot_fit_2[[52]], plot_fit_2[[53]], plot_fit_2[[54]], plot_fit_2[[55]], plot_fit_2[[56]], plot_fit_2[[57]], plot_fit_2[[58]], plot_fit_2[[59]], plot_fit_2[[60]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[61]], plot_fit_2[[62]], plot_fit_2[[63]], plot_fit_2[[64]], plot_fit_2[[65]], plot_fit_2[[66]], plot_fit_2[[67]], plot_fit_2[[68]], plot_fit_2[[69]], plot_fit_2[[70]], plot_fit_2[[71]], plot_fit_2[[72]], ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[73]], plot_fit_2[[74]], plot_fit_2[[75]], plot_fit_2[[76]], plot_fit_2[[77]], plot_fit_2[[78]], plot_fit_2[[79]], plot_fit_2[[80]], plot_fit_2[[81]], plot_fit_2[[82]],plot_fit_2[[83]], plot_fit_2[[84]],  ncol=4, nrow=3)
+ grid.arrange(plot_fit_2[[85]], plot_fit_2[[86]], plot_fit_2[[87]], plot_fit_2[[88]], plot_fit_2[[89]], plot_fit_2[[90]], plot_fit_2[[91]], plot_fit_2[[92]], plot_fit_2[[93]], plot_fit_2[[94]],plot_fit_2[[95]], plot_fit_2[[96]],  ncol=4, nrow=3)
+dev.off()
+```
